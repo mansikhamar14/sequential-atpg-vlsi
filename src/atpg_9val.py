@@ -82,34 +82,40 @@ class NineValueAlgorithm:
 
         uc = unroll(self.circuit, self.num_frames)
 
-        fault_wire_key = uc.wire_key(fault_wire, 0)
-        if fault_wire_key not in uc.wires:
+        # Permanent fault model: fault exists in ALL time frames
+        fval = fault_value_9v(fault_type)
+        fault_wire_keys = []
+        for t in self._frames:
+            fwk = uc.wire_key(fault_wire, t)
+            if fwk in uc.wires:
+                fault_wire_keys.append(fwk)
+
+        if not fault_wire_keys:
             return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
                               time_s=time.time() - t0,
                               detail="fault wire not in unrolled circuit")
 
-        fval = fault_value_9v(fault_type)
         state = {wk: "X/X" for wk in uc.wires}
         backtracks = [0]
 
-        # ── Step 1: Fault Activation ─────────────────────────────────────
-        state[fault_wire_key] = fval
+        # ── Step 1: Fault Activation in ALL frames ───────────────────
+        for fwk in fault_wire_keys:
+            state[fwk] = fval
 
         # ── Step 2: Forward imply ────────────────────────────────────────
-        self._imply(state, uc, fault_wire_key, fval)
+        self._imply(state, uc, fault_wire_keys, fval)
 
         if state.get("__conflict__"):
             return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
                               time_s=time.time() - t0, detail="initial conflict")
 
         if self._fault_at_po(state, uc):
-            uc.wires.update(state)
             tv = self._extract_tv(state, uc)
             return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
                               test_vector=tv, time_s=time.time() - t0)
 
         # ── Step 3: Search (PODEM-style) ─────────────────────────────────
-        success = self._search(state, uc, fault_wire_key, fval, backtracks)
+        success = self._search(state, uc, fault_wire_keys, fval, backtracks)
         elapsed = time.time() - t0
 
         if backtracks[0] > self.backtrack_limit:
@@ -127,14 +133,14 @@ class NineValueAlgorithm:
 
     # ── Recursive Search ─────────────────────────────────────────────────
 
-    def _search(self, state, uc, fault_wk, fval, backtracks):
+    def _search(self, state, uc, fault_wks, fval, backtracks):
         if backtracks[0] > self.backtrack_limit:
             return False
 
         if self._fault_at_po(state, uc):
             return True
 
-        objective = self._get_objective(state, uc, fault_wk, fval)
+        objective = self._get_objective(state, uc, fault_wks, fval)
         if objective is None:
             return False
 
@@ -154,13 +160,13 @@ class NineValueAlgorithm:
             saved = state.copy()
 
             state[pi_wire] = try_val
-            self._imply(state, uc, fault_wk, fval)
+            self._imply(state, uc, fault_wks, fval)
 
             if not state.get("__conflict__"):
                 if self._fault_at_po(state, uc):
                     return True
-                if self._d_frontier(state, uc) or self._fault_at_po(state, uc):
-                    if self._search(state, uc, fault_wk, fval, backtracks):
+                if self._d_frontier(state, uc):
+                    if self._search(state, uc, fault_wks, fval, backtracks):
                         return True
 
             state.clear()
@@ -171,25 +177,36 @@ class NineValueAlgorithm:
 
     # ── Objective ────────────────────────────────────────────────────────
 
-    def _get_objective(self, state, uc, fault_wk, fval):
-        fwire_val = state.get(fault_wk, "X/X")
+    def _get_objective(self, state, uc, fault_wks, fval):
+        # Check if any fault wire still needs activation
+        good_needed = good_val(fval)
+        for fwk in fault_wks:
+            fwire_val = state.get(fwk, "X/X")
+            if not is_discrepant(fwire_val):
+                driver = uc.fanin.get(fwk)
+                if driver is None:
+                    return (fwk, good_needed)
+                if driver[0] == "DFF_CONNECT":
+                    return (driver[1], good_needed)
+                return (fwk, good_needed)
 
-        # If fault not activated, drive it
-        if not is_discrepant(fwire_val):
-            good_needed = good_val(fval)
-            driver = uc.fanin.get(fault_wk)
-            if driver is None:
-                return (fault_wk, good_needed)
-            if driver[0] == "DFF_CONNECT":
-                return (driver[1], good_needed)
-            return (fault_wk, good_needed)
-
-        # Fault activated — propagate via D-frontier
+        # All fault wires activated — propagate via D-frontier
         frontier = self._d_frontier(state, uc)
         if not frontier:
             return None
 
         gate_key = frontier[0]
+
+        # Skip DFF frontier entries — implication handles DFF propagation
+        if isinstance(gate_key, tuple) and gate_key[0] == "__DFF__":
+            # Find next combinational gate in frontier
+            for gk in frontier[1:]:
+                if not (isinstance(gk, tuple) and gk[0] == "__DFF__"):
+                    gate_key = gk
+                    break
+            else:
+                return None  # Only DFF frontier entries remain
+
         gate = uc.gates[gate_key]
         gtype = gate.gate_type
         cv = ctrl_val_9v(gtype)
@@ -284,7 +301,8 @@ class NineValueAlgorithm:
 
     # ── Forward Implication ──────────────────────────────────────────────
 
-    def _imply(self, state, uc, fault_wk, fval):
+    def _imply(self, state, uc, fault_wks, fval):
+        fault_wk_set = set(fault_wks)
         changed = True
         max_iters = 30
         iters = 0
@@ -305,6 +323,9 @@ class NineValueAlgorithm:
                     d_val = state.get(d_wk, "X/X")
                     q_val = state.get(q_wk, "X/X")
                     if d_val != "X/X" and d_val != q_val:
+                        # Don't overwrite fault sites via DFF
+                        if q_wk in fault_wk_set:
+                            continue
                         merged = merge_9val(q_val, d_val)
                         if merged is None:
                             state["__conflict__"] = True
@@ -331,16 +352,16 @@ class NineValueAlgorithm:
 
                     out_wire = gate.output
 
-                    if out_wire == fault_wk:
+                    if out_wire in fault_wk_set:
+                        # Update the good-circuit value while preserving the faulty value
                         old = state.get(out_wire, "X/X")
-                        if old != "X/X" and new_val != "X/X":
-                            g_new = good_val(new_val)
-                            f_old = faulty_val(old)
-                            if g_new != "X":
-                                updated = encode(g_new, f_old)
-                                if updated != old:
-                                    state[out_wire] = updated
-                                    changed = True
+                        g_new = good_val(new_val)
+                        f_old = faulty_val(fval)  # Always use the stuck-at faulty value
+                        if g_new != "X":
+                            updated = encode(g_new, f_old)
+                            if updated != old:
+                                state[out_wire] = updated
+                                changed = True
                         continue
 
                     old_val = state.get(out_wire, "X/X")
@@ -353,8 +374,15 @@ class NineValueAlgorithm:
                             state[out_wire] = merged
                             changed = True
 
-            # Re-enforce fault
-            state[fault_wk] = fval
+            # Re-enforce fault in ALL frames
+            for fwk in fault_wks:
+                cur = state.get(fwk, "X/X")
+                g_cur = good_val(cur)
+                f_fault = faulty_val(fval)
+                if g_cur != "X":
+                    state[fwk] = encode(g_cur, f_fault)
+                else:
+                    state[fwk] = fval
             iters += 1
 
     # ── D-Frontier ───────────────────────────────────────────────────────
@@ -372,6 +400,27 @@ class NineValueAlgorithm:
             in_vals = [state.get(iw, "X/X") for iw in gate.inputs]
             if any(is_discrepant(v) for v in in_vals):
                 frontier.append(gate_key)
+
+        # Also check DFF boundaries for fault propagation across frames
+        for ff_gname in self.circuit.flip_flops:
+            ff_gate = self.circuit.gates[ff_gname]
+            d_wire = ff_gate.inputs[0]
+            q_wire = ff_gate.output
+            for idx, t in enumerate(self._frames[1:], start=1):
+                prev_t = self._frames[idx - 1]
+                d_wk = uc.wire_key(d_wire, prev_t)
+                q_wk = uc.wire_key(q_wire, t)
+                d_val = state.get(d_wk, "X/X")
+                q_val = state.get(q_wk, "X/X")
+                if is_discrepant(d_val) and not is_discrepant(q_val):
+                    # DFF boundary needs propagation — handled by implication
+                    # but signals that frontier still exists
+                    frontier.append(("__DFF__", ff_gname))
+                    break
+
+        # Prioritize gates closer to POs (later in topo order = closer to output)
+        topo_index = {g: i for i, g in enumerate(self._topo)}
+        frontier.sort(key=lambda gk: topo_index.get(gk[1], 0) if isinstance(gk[0], int) else -1, reverse=True)
         return frontier
 
     # ── Fault at PO ──────────────────────────────────────────────────────
@@ -386,6 +435,7 @@ class NineValueAlgorithm:
 
     def _extract_tv(self, state, uc):
         frames = list(range(-(uc.num_frames - 1), 1))
+        earliest = frames[0]
         tv = []
         for t in frames:
             frame_vals = {}
@@ -394,6 +444,14 @@ class NineValueAlgorithm:
                 val_9 = state.get(wk, "X/X")
                 g = good_val(val_9)
                 frame_vals[pi] = str(g) if g != "X" else "0"
+            # Include FF initial states (PPIs) in the earliest frame
+            if t == earliest:
+                for ff_gname in self.circuit.flip_flops:
+                    q_wire = self.circuit.gates[ff_gname].output
+                    wk = uc.wire_key(q_wire, t)
+                    val_9 = state.get(wk, "X/X")
+                    g = good_val(val_9)
+                    frame_vals[q_wire] = str(g) if g != "X" else "0"
             tv.append(frame_vals)
         return tv
 

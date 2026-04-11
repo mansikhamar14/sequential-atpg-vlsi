@@ -420,9 +420,18 @@ Examples:
         if os.path.isfile("benchmarks/s298.v"):
             benches.append("benchmarks/s298.v")
 
+        # Auto-compute frame lists based on sequential depth of each benchmark
+        max_d_seq = 1
+        for b in benches:
+            c = parse_verilog(b)
+            d, _ = compute_sequential_depth(c)
+            if d > max_d_seq:
+                max_d_seq = d
+        auto_frames = sorted(set([2, max_d_seq + 1, max_d_seq + 2]))
+
         design_space_sweep(
             bench_paths=benches,
-            frames_list=[2, 4],
+            frames_list=auto_frames,
             bt_limits=[10, 50],
             out_csv="results/design_space.csv"
         )

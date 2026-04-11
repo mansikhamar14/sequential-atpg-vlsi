@@ -113,11 +113,12 @@ def unroll(circuit: Circuit, num_frames: int) -> UnrolledCircuit:
             uc.wires.setdefault(wk, "X")
             uc.primary_inputs.append(wk)
 
-    # ── Primary outputs — only from frame 0 ──────────────────────────────
-    for po in circuit.primary_outputs:
-        wk = uc.wire_key(po, 0)
-        uc.wires.setdefault(wk, "X")
-        uc.primary_outputs.append(wk)
+    # ── Primary outputs — from ALL frames (fault observable in any frame)
+    for t in frames:
+        for po in circuit.primary_outputs:
+            wk = uc.wire_key(po, t)
+            uc.wires.setdefault(wk, "X")
+            uc.primary_outputs.append(wk)
 
     # ── DFF inter-frame connections ───────────────────────────────────────
     for ff_gname in circuit.flip_flops:
