@@ -151,7 +151,19 @@ class FaultSimulator:
     def _sim_seq_good(self, tv_seq):
         states = []
         ff_state = None
-        for frame_inputs in tv_seq:
+        for i, frame_inputs in enumerate(tv_seq):
+            # On the first frame, extract FF initial states from test vector
+            if i == 0 and ff_state is None:
+                init_ff = {}
+                for ff in self.circuit.flip_flops:
+                    q_wire = self.circuit.gates[ff].output
+                    if q_wire in frame_inputs:
+                        raw = frame_inputs[q_wire]
+                        init_ff[q_wire] = int(raw) if isinstance(raw, str) and raw.isdigit() else raw
+                    else:
+                        init_ff[q_wire] = "X"
+                if any(v != "X" for v in init_ff.values()):
+                    ff_state = init_ff
             state = simulate_good(self.circuit, frame_inputs, ff_state)
             # Next-state: use the D-input values as the new FF state
             next_ff = {}
@@ -166,7 +178,19 @@ class FaultSimulator:
         """Permanent fault: inject stuck-at in EVERY frame of the sequence."""
         states = []
         ff_state = None
-        for frame_inputs in tv_seq:
+        for i, frame_inputs in enumerate(tv_seq):
+            # On the first frame, extract FF initial states from test vector
+            if i == 0 and ff_state is None:
+                init_ff = {}
+                for ff in self.circuit.flip_flops:
+                    q_wire = self.circuit.gates[ff].output
+                    if q_wire in frame_inputs:
+                        raw = frame_inputs[q_wire]
+                        init_ff[q_wire] = int(raw) if isinstance(raw, str) and raw.isdigit() else raw
+                    else:
+                        init_ff[q_wire] = "X"
+                if any(v != "X" for v in init_ff.values()):
+                    ff_state = init_ff
             # Simulate good first, then inject fault and re-propagate
             state = simulate_faulty(self.circuit, frame_inputs,
                                     fault_wire, fault_type, ff_state)
