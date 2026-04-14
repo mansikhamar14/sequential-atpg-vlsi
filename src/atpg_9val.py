@@ -75,6 +75,11 @@ class NineValueAlgorithm:
         self.backtrack_limit = backtrack_limit
         self._topo = topological_order(circuit)
         self._frames = list(range(-(num_frames - 1), 1))
+        self._trace_recorder = None  # opt-in hook, set externally
+
+    def _trace(self, label, state, frontier_keys=None, objective_wire=None):
+        if self._trace_recorder is not None:
+            self._trace_recorder.record(label, state, frontier_keys, objective_wire)
 
     def generate_test(self, fault_wire: str, fault_type: str) -> ATPGResult:
         """Attempt to generate a test vector for the given stuck-at fault."""
@@ -101,9 +106,12 @@ class NineValueAlgorithm:
         # ── Step 1: Fault Activation in ALL frames ───────────────────
         for fwk in fault_wire_keys:
             state[fwk] = fval
+        self._trace("Fault activation in all frames", state)
 
         # ── Step 2: Forward imply ────────────────────────────────────────
         self._imply(state, uc, fault_wire_keys, fval)
+        self._trace("After initial forward implication", state,
+                    frontier_keys=self._d_frontier(state, uc))
 
         if state.get("__conflict__"):
             return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
@@ -160,7 +168,11 @@ class NineValueAlgorithm:
             saved = state.copy()
 
             state[pi_wire] = try_val
+            self._trace(f"Assign {pi_wire}={try_val}", state,
+                        objective_wire=obj_wire)
             self._imply(state, uc, fault_wks, fval)
+            self._trace(f"After imply (assigned {pi_wire}={try_val})", state,
+                        frontier_keys=self._d_frontier(state, uc))
 
             if not state.get("__conflict__"):
                 if self._fault_at_po(state, uc):
