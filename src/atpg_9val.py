@@ -484,7 +484,7 @@ if __name__ == "__main__":
     import sys
     from parser import parse_verilog
 
-    path = sys.argv[1] if len(sys.argv) > 1 else "benchmarks/s27.v"
+    path = sys.argv[1] if len(sys.argv) > 1 else "../benchmarks/s27.v"
     nf   = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
     circ = parse_verilog(path)
