@@ -111,9 +111,11 @@ def run_comparison(bench_path, num_frames, bt_limit, verbose=False):
     # Complexity estimate
     n_pi = len(circuit.primary_inputs)
     n_ff = len(circuit.flip_flops)
-    print(f"\n  Complexity estimate:")
-    print(f"    n (PIs) = {n_pi},  f (FFs) = {n_ff}")
-    print(f"    O(2^n × 2^f) = O(2^{n_pi} × 2^{n_ff}) = O({2**n_pi * 2**n_ff})")
+    print(f"\n  Complexity estimate (State & Search Space bounds):")
+    print(f"    n (PIs) = {n_pi}, f (FFs) = {n_ff}, k (frames) = {num_frames}")
+    print(f"    Physical Boolean Space         : O(2^(n×k) × 2^f) = O({(2**(n_pi * num_frames)) * (2**n_ff)})")
+    print(f"    ExtD 5-Valued Space (k frames) : O(2^(n×k) × 5^f) = O({(2**(n_pi * num_frames)) * (5**n_ff)})")
+    print(f"    9Val 9-Valued Space (k frames) : O(2^(n×k) × 9^f) = O({(2**(n_pi * num_frames)) * (9**n_ff)})")
 
     results = {}
 
