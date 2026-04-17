@@ -103,9 +103,15 @@ class NineValueAlgorithm:
         state = {wk: "X/X" for wk in uc.wires}
         backtracks = [0]
 
-        # ── Step 1: Fault Activation in ALL frames ───────────────────
+        # ── Step 1: Install permanent stuck-at on faulty side only ────
+        # The good-circuit value must be justified through the driver —
+        # we do NOT pre-set it to the activation polarity. The faulty
+        # side is fixed at the stuck value in every frame (permanent
+        # fault model); the good side starts as X and is resolved by
+        # forward implication + search.
+        f_stuck = faulty_val(fval)
         for fwk in fault_wire_keys:
-            state[fwk] = fval
+            state[fwk] = encode("X", f_stuck)
         self._trace("Fault activation in all frames", state)
 
         # ── Step 2: Forward imply ────────────────────────────────────────
@@ -119,8 +125,9 @@ class NineValueAlgorithm:
 
         if self._fault_at_po(state, uc):
             tv = self._extract_tv(state, uc)
-            return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
-                              test_vector=tv, time_s=time.time() - t0)
+            if self._verify_tv(tv, fault_wire, fault_type):
+                return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
+                                  test_vector=tv, time_s=time.time() - t0)
 
         # ── Step 3: Search (PODEM-style) ─────────────────────────────────
         success = self._search(state, uc, fault_wire_keys, fval, backtracks)
@@ -132,12 +139,27 @@ class NineValueAlgorithm:
 
         if success:
             tv = self._extract_tv(state, uc)
-            return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
-                              test_vector=tv, backtracks=backtracks[0],
-                              time_s=elapsed)
+            if self._verify_tv(tv, fault_wire, fault_type):
+                return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
+                                  test_vector=tv, backtracks=backtracks[0],
+                                  time_s=elapsed)
+            # Internal D-path claimed detection but fault simulation
+            # disagrees — unjustified PI/PPI values on the support of the
+            # D-path likely broke under default concretization.
+            return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
+                              backtracks=backtracks[0], time_s=elapsed,
+                              detail="verification failed")
 
         return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
                           backtracks=backtracks[0], time_s=elapsed)
+
+    def _verify_tv(self, tv, fault_wire, fault_type):
+        """Fault-simulate the extracted TV to confirm the fault is really
+        detected. Prevents false positives caused by unjustified PI/PPI
+        values getting concretized to arbitrary defaults."""
+        from fault_sim import FaultSimulator
+        sim = FaultSimulator(self.circuit)
+        return (fault_wire, fault_type) in sim.simulate([tv], [(fault_wire, fault_type)])
 
     # ── Recursive Search ─────────────────────────────────────────────────
 
@@ -160,16 +182,32 @@ class NineValueAlgorithm:
 
         pi_wire, pi_val = pi_result
 
-        # Try the suggested value and its complement
-        alt_g = 1 - good_val(pi_val) if good_val(pi_val) != "X" else 0
-        alt_val = encode(alt_g, alt_g)
+        # Try the suggested value and its complement. When the primary
+        # value has an unknown good side, try both concrete polarities.
+        g = good_val(pi_val)
+        if g == "X":
+            pi_val = encode(0, 0)
+            alt_val = encode(1, 1)
+        else:
+            alt_val = encode(1 - g, 1 - g)
+
+        fault_wk_set = set(fault_wks)
+        f_stuck = faulty_val(fval)
 
         for try_val in [pi_val, alt_val]:
             saved = state.copy()
 
-            state[pi_wire] = try_val
+            # When the PI being assigned is itself a fault wire, the faulty
+            # side must stay pinned to the stuck value — preserve partial
+            # activation rather than forcing full equality.
+            if pi_wire in fault_wk_set:
+                g = good_val(try_val)
+                state[pi_wire] = encode(g, f_stuck)
+            else:
+                state[pi_wire] = try_val
             self._trace(f"Assign {pi_wire}={try_val}", state,
                         objective_wire=obj_wire)
+            state.pop("__conflict__", None)
             self._imply(state, uc, fault_wks, fval)
             self._trace(f"After imply (assigned {pi_wire}={try_val})", state,
                         frontier_keys=self._d_frontier(state, uc))
@@ -177,7 +215,8 @@ class NineValueAlgorithm:
             if not state.get("__conflict__"):
                 if self._fault_at_po(state, uc):
                     return True
-                if self._d_frontier(state, uc):
+                if self._d_frontier(state, uc) or \
+                   self._needs_activation(state, fault_wks):
                     if self._search(state, uc, fault_wks, fval, backtracks):
                         return True
 
@@ -187,20 +226,32 @@ class NineValueAlgorithm:
 
         return False
 
+    def _needs_activation(self, state, fault_wks):
+        """True if no fault wire has become discrepant yet."""
+        return not any(is_discrepant(state.get(fwk, "X/X")) for fwk in fault_wks)
+
     # ── Objective ────────────────────────────────────────────────────────
 
     def _get_objective(self, state, uc, fault_wks, fval):
-        # Check if any fault wire still needs activation
         good_needed = good_val(fval)
-        for fwk in fault_wks:
-            fwire_val = state.get(fwk, "X/X")
-            if not is_discrepant(fwire_val):
-                driver = uc.fanin.get(fwk)
-                if driver is None:
-                    return (fwk, good_needed)
-                if driver[0] == "DFF_CONNECT":
-                    return (driver[1], good_needed)
-                return (fwk, good_needed)
+        # Only generate an activation objective if NO frame is yet activated.
+        if self._needs_activation(state, fault_wks):
+            best = None
+            for fwk in fault_wks:
+                g = good_val(state.get(fwk, "X/X"))
+                if g == "X":
+                    best = fwk
+                    break
+            if best is None:
+                # Every frame's good side is already pinned to the stuck
+                # value — no frame can activate with current commitments.
+                return None
+            driver = uc.fanin.get(best)
+            if driver is None:
+                return (best, good_needed)
+            if driver[0] == "DFF_CONNECT":
+                return (driver[1], good_needed)
+            return (best, good_needed)
 
         # All fault wires activated — propagate via D-frontier
         frontier = self._d_frontier(state, uc)
@@ -227,11 +278,21 @@ class NineValueAlgorithm:
             return None
 
         nc = 1 - cv
+        # Only pick an input whose known good side doesn't already clash with
+        # the non-controlling value we need (e.g. "0/X" on an AND input when
+        # nc=1 would be a dead-end — good=0 is already controlling).
         for iw in gate.inputs:
             iv = state.get(iw, "X/X")
-            if not is_discrepant(iv) and (iv == "X/X" or is_unknown(iv)):
+            if is_discrepant(iv):
+                continue
+            g = good_val(iv)
+            if g == "X":
                 return (iw, nc)
-
+            if g == nc:
+                # already non-controlling, no objective needed for this input
+                continue
+            # g is the controlling value — this input can't be justified
+            # to nc without conflict; skip it.
         return None
 
     # ── Backtrace ────────────────────────────────────────────────────────
@@ -249,7 +310,9 @@ class NineValueAlgorithm:
             cv = state.get(current_wire, "X/X")
 
             if current_wire in uc.primary_inputs or current_wire in uc.pseudo_primary_inputs:
-                if cv == "X/X":
+                # A PI is assignable if its good side is still unresolved,
+                # including the fault-wire case where state is "X/<stuck>".
+                if good_val(cv) == "X":
                     if isinstance(current_val, int):
                         return (current_wire, encode(current_val, current_val))
                     return (current_wire, encode(0, 0))
@@ -304,11 +367,10 @@ class NineValueAlgorithm:
             if not found:
                 break
 
-        for pi in uc.primary_inputs + uc.pseudo_primary_inputs:
-            if state.get(pi, "X/X") == "X/X":
-                v = current_val if isinstance(current_val, int) else 0
-                return (pi, encode(v, v))
-
+        # Backtrace fell off the path without reaching an assignable PI.
+        # Rather than picking an arbitrary PI with a meaningless polarity
+        # (which produces random assignments and inflates backtracks),
+        # signal failure so _search can try a different objective.
         return None
 
     # ── Forward Implication ──────────────────────────────────────────────
@@ -324,6 +386,7 @@ class NineValueAlgorithm:
             state.pop("__conflict__", None)
 
             # Resolve DFF connections
+            f_stuck = faulty_val(fval)
             for ff_gname in self.circuit.flip_flops:
                 ff_gate = self.circuit.gates[ff_gname]
                 d_wire = ff_gate.inputs[0]
@@ -334,17 +397,22 @@ class NineValueAlgorithm:
                     q_wk = uc.wire_key(q_wire, t)
                     d_val = state.get(d_wk, "X/X")
                     q_val = state.get(q_wk, "X/X")
-                    if d_val != "X/X" and d_val != q_val:
-                        # Don't overwrite fault sites via DFF
-                        if q_wk in fault_wk_set:
-                            continue
-                        merged = merge_9val(q_val, d_val)
-                        if merged is None:
-                            state["__conflict__"] = True
-                            return
-                        if merged != q_val:
-                            state[q_wk] = merged
-                            changed = True
+                    if d_val == "X/X" or d_val == q_val:
+                        continue
+                    if q_wk in fault_wk_set:
+                        # Fault wire Q: inherit good side from D, keep
+                        # faulty side pinned to the stuck value.
+                        g_new = good_val(d_val)
+                        candidate = encode(g_new, f_stuck)
+                    else:
+                        candidate = d_val
+                    merged = merge_9val(q_val, candidate)
+                    if merged is None:
+                        state["__conflict__"] = True
+                        return
+                    if merged != q_val:
+                        state[q_wk] = merged
+                        changed = True
 
             # Evaluate combinational gates
             for t in self._frames:
@@ -365,14 +433,21 @@ class NineValueAlgorithm:
                     out_wire = gate.output
 
                     if out_wire in fault_wk_set:
-                        # Update the good-circuit value while preserving the faulty value
+                        # Update the good-circuit value while preserving the
+                        # faulty value (permanent stuck-at). Use merge so that
+                        # any previously-implied good value conflicts are
+                        # caught rather than silently overwritten.
                         old = state.get(out_wire, "X/X")
                         g_new = good_val(new_val)
-                        f_old = faulty_val(fval)  # Always use the stuck-at faulty value
+                        f_old = faulty_val(fval)
                         if g_new != "X":
-                            updated = encode(g_new, f_old)
-                            if updated != old:
-                                state[out_wire] = updated
+                            candidate = encode(g_new, f_old)
+                            merged = merge_9val(old, candidate)
+                            if merged is None:
+                                state["__conflict__"] = True
+                                return
+                            if merged != old:
+                                state[out_wire] = merged
                                 changed = True
                         continue
 
@@ -386,15 +461,13 @@ class NineValueAlgorithm:
                             state[out_wire] = merged
                             changed = True
 
-            # Re-enforce fault in ALL frames
+            # Re-enforce the stuck value on the faulty side in ALL frames.
+            # DO NOT force the good side — it must be derived from the driver.
             for fwk in fault_wks:
                 cur = state.get(fwk, "X/X")
                 g_cur = good_val(cur)
                 f_fault = faulty_val(fval)
-                if g_cur != "X":
-                    state[fwk] = encode(g_cur, f_fault)
-                else:
-                    state[fwk] = fval
+                state[fwk] = encode(g_cur, f_fault)
             iters += 1
 
     # ── D-Frontier ───────────────────────────────────────────────────────

@@ -101,17 +101,20 @@ class ExtendedDAlgorithm:
         state = {wk: X for wk in uc.wires}
         backtracks = [0]
 
-        # ── Step 1: Fault Activation in ALL frames ───────────────────
-        for fwk in fault_wire_keys:
-            state[fwk] = activation_val
-
-        # ── Step 2 & 3: Forward imply, then search ──────────────────
+        # ── Step 1: Initial forward implication ─────────────────────
+        # Fault wires start at X — activation must be justified through the
+        # driver (via search/backtrace), not forced.
         self._imply_forward(state, uc, fault_wire_keys, activation_val)
+
+        if state.get("__conflict__"):
+            return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
+                              time_s=time.time() - t0, detail="initial conflict")
 
         if self._fault_at_po(state, uc):
             tv = self._extract_tv(state, uc)
-            return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
-                              test_vector=tv, time_s=time.time() - t0)
+            if self._verify_tv(tv, fault_wire, fault_type):
+                return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
+                                  test_vector=tv, time_s=time.time() - t0)
 
         success = self._search(state, uc, fault_wire_keys, activation_val, backtracks)
         elapsed = time.time() - t0
@@ -122,12 +125,29 @@ class ExtendedDAlgorithm:
 
         if success:
             tv = self._extract_tv(state, uc)
-            return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
-                              test_vector=tv, backtracks=backtracks[0],
-                              time_s=elapsed)
+            if self._verify_tv(tv, fault_wire, fault_type):
+                return ATPGResult(ATPGResult.DETECTED, fault_wire, fault_type,
+                                  test_vector=tv, backtracks=backtracks[0],
+                                  time_s=elapsed)
+            # Internal D-path claimed detection but fault simulation
+            # disagrees — this usually means some PI/PPI on the support
+            # of the D-path was not justified and the extractor's default
+            # values broke the path. Report as undetectable rather than
+            # returning an invalid test vector.
+            return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
+                              backtracks=backtracks[0], time_s=elapsed,
+                              detail="verification failed")
 
         return ATPGResult(ATPGResult.UNDETECTABLE, fault_wire, fault_type,
                           backtracks=backtracks[0], time_s=elapsed)
+
+    def _verify_tv(self, tv, fault_wire, fault_type):
+        """Fault-simulate the extracted TV to confirm the fault is really
+        detected. Prevents false positives caused by unjustified PI/PPI
+        values getting concretized to arbitrary defaults."""
+        from fault_sim import FaultSimulator
+        sim = FaultSimulator(self.circuit)
+        return (fault_wire, fault_type) in sim.simulate([tv], [(fault_wire, fault_type)])
 
     # ── Recursive Search ─────────────────────────────────────────────────
 
@@ -158,12 +178,14 @@ class ExtendedDAlgorithm:
             saved = state.copy()
 
             state[pi_wire] = try_val
+            state.pop("__conflict__", None)
             self._imply_forward(state, uc, fault_wks, act_val)
 
-            if not self._has_conflict(state, uc):
+            if not state.get("__conflict__") and not self._has_conflict(state, uc):
                 if self._fault_at_po(state, uc):
                     return True
-                if self._d_frontier(state, uc, fault_wks):
+                if self._d_frontier(state, uc, fault_wks) or \
+                   self._needs_activation(state, fault_wks):
                     if self._search(state, uc, fault_wks, act_val, backtracks):
                         return True
 
@@ -173,31 +195,55 @@ class ExtendedDAlgorithm:
 
         return False
 
+    def _needs_activation(self, state, fault_wks):
+        """True if no fault wire is currently activated (D/D_BAR)."""
+        return not any(is_d_value(state.get(fwk, X)) for fwk in fault_wks)
+
     # ── Objective determination ──────────────────────────────────────────
 
     def _get_objective(self, state, uc, fault_wks, act_val):
-        # Check if any fault wire still needs activation
         good_val_needed = ONE if act_val == D else ZERO
-        for fwk in fault_wks:
-            fval = state.get(fwk, X)
-            if not is_d_value(fval):
-                driver_info = uc.fanin.get(fwk)
-                if driver_info is None:
-                    return (fwk, good_val_needed)
-                if driver_info[0] == "DFF_CONNECT":
-                    return (driver_info[1], good_val_needed)
-                return (fwk, good_val_needed)
 
-        # All fault wires activated — propagate via D-frontier
+        # If no fault wire is yet activated, generate an activation objective.
+        if self._needs_activation(state, fault_wks):
+            # Prefer a frame where the fault wire's current value is X
+            # (i.e. unconstrained) over one where it already has an
+            # incompatible plain 0/1.
+            best = None
+            for fwk in fault_wks:
+                fval = state.get(fwk, X)
+                if fval == X:
+                    best = fwk
+                    break
+            if best is None:
+                # All fault wires have incompatible plain values — unroll deeper
+                # won't help in this pass. Report no objective.
+                return None
+
+            driver_info = uc.fanin.get(best)
+            if driver_info is None:
+                # PI or PPI fault wire — drive directly
+                return (best, good_val_needed)
+            if driver_info[0] == "DFF_CONNECT":
+                # PPI fed by previous-frame DFF D-input — justify that D value
+                return (driver_info[1], good_val_needed)
+            return (best, good_val_needed)
+
+        # Fault activated somewhere — propagate via D-frontier
         frontier = self._d_frontier(state, uc, fault_wks)
         if not frontier:
             return None
 
         gate_key = frontier[0]
         if gate_key == "__DFF__":
-            # DFF frontier element — need to justify the D-input value
-            # Already handled by implication, just need more PIs set
-            return None
+            # DFF boundary: propagation handled by implication on its own;
+            # search needs to assign more PIs so D can walk forward.
+            for gk in frontier[1:]:
+                if gk != "__DFF__":
+                    gate_key = gk
+                    break
+            else:
+                return None
 
         gate = uc.gates[gate_key]
         gtype = gate.gate_type
@@ -296,12 +342,23 @@ class ExtendedDAlgorithm:
 
     def _imply_forward(self, state, uc, fault_wks, act_val):
         fault_wk_set = set(fault_wks)
+        good_needed = ONE if act_val == D else ZERO
         changed = True
         max_iters = 30
         iters = 0
 
         while changed and iters < max_iters:
             changed = False
+
+            # ── Normalize fault wires: convert plain 0/1 that matches the
+            # activation value into its D/D_BAR form. Values that differ from
+            # the activation value mean the fault is NOT activated in that
+            # frame (good == faulty == stuck-val), which is fine.
+            for fwk in fault_wks:
+                v = state.get(fwk, X)
+                if v == good_needed:
+                    state[fwk] = act_val
+                    changed = True
 
             # Resolve DFF connections — propagate D/D_BAR through DFFs
             for ff_gname in self.circuit.flip_flops:
@@ -315,10 +372,17 @@ class ExtendedDAlgorithm:
                     d_val = state.get(d_wk, X)
                     q_val = state.get(q_wk, X)
                     if d_val != X and q_val == X:
-                        # Don't overwrite fault sites
-                        if q_wk not in fault_wk_set:
-                            state[q_wk] = d_val
-                            changed = True
+                        new_q = self._fault_site_value(d_val, act_val, good_needed) \
+                                if q_wk in fault_wk_set else d_val
+                        if new_q is None:
+                            state["__conflict__"] = True
+                            return
+                        state[q_wk] = new_q
+                        changed = True
+                    elif d_val != X and q_val != X and q_wk in fault_wk_set:
+                        if self._fault_site_conflict(d_val, q_val, act_val, good_needed):
+                            state["__conflict__"] = True
+                            return
 
             # Evaluate combinational gates
             for t in self._frames:
@@ -333,22 +397,67 @@ class ExtendedDAlgorithm:
                         continue
 
                     new_val = evaluate_gate_5v(gate.gate_type, in_vals)
-                    out_wire = gate.output
-
-                    # Don't overwrite fault sites
-                    if out_wire in fault_wk_set:
+                    if new_val == X:
                         continue
 
+                    out_wire = gate.output
                     old_val = state.get(out_wire, X)
-                    if new_val != X and new_val != old_val:
+
+                    if out_wire in fault_wk_set:
+                        desired = self._fault_site_value(new_val, act_val, good_needed)
+                        if desired is None:
+                            # Driver cannot produce activation — check if
+                            # incompatible with current value or just means
+                            # no activation this frame.
+                            desired = new_val
+                        if old_val == X:
+                            state[out_wire] = desired
+                            changed = True
+                        elif desired != old_val:
+                            if self._fault_site_conflict(new_val, old_val, act_val, good_needed):
+                                state["__conflict__"] = True
+                                return
+                        continue
+
+                    if new_val != old_val:
                         if old_val == X:
                             state[out_wire] = new_val
                             changed = True
-
-            # Re-enforce fault in ALL frames
-            for fwk in fault_wks:
-                state[fwk] = act_val
+                        # else: leave — conflict detector handles it
             iters += 1
+
+    # ── Fault-site helpers ───────────────────────────────────────────────
+
+    def _fault_site_value(self, computed, act_val, good_needed):
+        """Given the driver-computed value, return the value the fault site
+        should take. Returns None if the computed value is incompatible with
+        activation (e.g. already a D-value of the opposite polarity)."""
+        # If driver produced an X or the needed good value, activate.
+        if computed == good_needed:
+            return act_val
+        # If driver produced a D-value matching our activation polarity.
+        if computed == act_val:
+            return act_val
+        # Opposite good value: fault not activated in this frame; the wire
+        # has good == faulty == stuck-val, which collapses to a plain 0 or 1.
+        if computed in (ZERO, ONE):
+            return computed
+        # Opposite D-value polarity: computed value conflicts with the fault.
+        if is_d_value(computed):
+            return None
+        return computed  # X
+
+    def _fault_site_conflict(self, computed, current, act_val, good_needed):
+        """True if `computed` and `current` are incompatible at a fault site."""
+        desired = self._fault_site_value(computed, act_val, good_needed)
+        if desired is None:
+            return True
+        if desired == current:
+            return False
+        # Either side still X is not a conflict.
+        if desired == X or current == X:
+            return False
+        return True
 
     # ── D-Frontier ───────────────────────────────────────────────────────
 
